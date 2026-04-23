@@ -1,10 +1,1 @@
-.vscode
-dist
-yarn.lock
-node_modules
-*.env
 .env
-audio
-.cache
-__trash__
-package-lock.json
