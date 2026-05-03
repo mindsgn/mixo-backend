@@ -16,15 +16,20 @@ type Engine struct {
 	currentSong *queue.Song
 	mu         sync.RWMutex
 	running    bool
+	paused     bool
 	stopChan   chan struct{}
+	pauseChan  chan struct{}
+	resumeChan chan struct{}
 }
 
 func New(db *sql.DB, q *queue.Manager) *Engine {
 	return &Engine{
-		db:        db,
-		queue:     q,
-		chunkChan: make(chan []byte, 100),
-		stopChan:  make(chan struct{}),
+		db:         db,
+		queue:      q,
+		chunkChan:  make(chan []byte, 100),
+		stopChan:   make(chan struct{}),
+		pauseChan:  make(chan struct{}),
+		resumeChan: make(chan struct{}),
 	}
 }
 
@@ -55,7 +60,26 @@ func (e *Engine) playbackLoop() {
 		select {
 		case <-e.stopChan:
 			return
+		case <-e.pauseChan:
+			// Wait for resume signal
+			select {
+			case <-e.stopChan:
+				return
+			case <-e.resumeChan:
+				e.mu.Lock()
+				e.paused = false
+				e.mu.Unlock()
+				continue
+			}
 		default:
+			e.mu.RLock()
+			paused := e.paused
+			e.mu.RUnlock()
+			if paused {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
 			song, err := e.queue.GetNext()
 			if err != nil {
 				log.Printf("Error getting next song: %v", err)
@@ -147,4 +171,34 @@ func (e *Engine) addToHistory(song *queue.Song, durationPlayed int) {
 	if err != nil {
 		log.Printf("Error adding to history: %v", err)
 	}
+}
+
+func (e *Engine) Pause() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running && !e.paused {
+		e.paused = true
+		select {
+		case e.pauseChan <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (e *Engine) Resume() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running && e.paused {
+		e.paused = false
+		select {
+		case e.resumeChan <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (e *Engine) IsPaused() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.paused
 }

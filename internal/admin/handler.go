@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"github.com/mindsgn-studio/mixo-backend/internal/config"
+	"github.com/mindsgn-studio/mixo-backend/internal/playback"
 	"github.com/mindsgn-studio/mixo-backend/internal/queue"
 	"strconv"
 	"strings"
@@ -19,13 +20,18 @@ import (
 )
 
 type Handler struct {
-	db      *sql.DB
-	queue   *queue.Manager
-	cfg     *config.Config
+	db       *sql.DB
+	queue    *queue.Manager
+	cfg      *config.Config
+	playback *playback.Engine
 }
 
 func New(db *sql.DB, q *queue.Manager, cfg *config.Config) *Handler {
 	return &Handler{db: db, queue: q, cfg: cfg}
+}
+
+func (h *Handler) SetPlayback(p *playback.Engine) {
+	h.playback = p
 }
 
 type AddSongRequest struct {
@@ -451,4 +457,379 @@ func getDuration(file io.Reader) (int, error) {
 	}
 
 	return int(duration), nil
+}
+
+// ==================== HTMX HANDLERS ====================
+
+// AdminPage renders the full admin page
+func (h *Handler) AdminPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	nowPlayingHTML := h.renderNowPlayingFragment()
+	songsHTML := h.renderSongsFragment()
+	queueHTML := h.renderQueueFragment()
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, adminPageTemplate, nowPlayingHTML, songsHTML, queueHTML)
+}
+
+// SongsFragment returns HTML table of songs
+func (h *Handler) SongsFragment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(h.renderSongsFragment()))
+}
+
+// QueueFragment returns HTML table of queue
+func (h *Handler) QueueFragment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(h.renderQueueFragment()))
+}
+
+// NowPlayingFragment returns now playing status HTML
+func (h *Handler) NowPlayingFragment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(h.renderNowPlayingFragment()))
+}
+
+// PlayControl handles play/stop toggle
+func (h *Handler) PlayControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if h.playback == nil {
+		http.Error(w, "Playback engine not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	if h.playback.IsPaused() {
+		h.playback.Resume()
+	} else {
+		h.playback.Pause()
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(h.renderNowPlayingFragment()))
+}
+
+// UploadSongHTMX handles file upload for HTMX
+func (h *Handler) UploadSongHTMX(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	err := r.ParseMultipartForm(10 << 20)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Failed to parse form")
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "No file provided")
+		return
+	}
+	defer file.Close()
+
+	// Validate file extension
+	ext := filepath.Ext(header.Filename)
+	if ext != ".mp3" {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Only MP3 files are allowed")
+		return
+	}
+
+	// Read file to extract metadata
+	metadata, err := tag.ReadFrom(file)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to read metadata: %v", err))
+		return
+	}
+
+	// Extract metadata
+	title := metadata.Title()
+	if title == "" {
+		title = header.Filename[:len(header.Filename)-len(ext)]
+	}
+	artist := metadata.Artist()
+	if artist == "" {
+		artist = "Unknown Artist"
+	}
+
+	// Reset file pointer for duration check
+	if _, err := file.Seek(0, 0); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Failed to reset file pointer")
+		return
+	}
+
+	// Get duration using FFprobe
+	duration, err := getDuration(file)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to get duration: %v", err))
+		return
+	}
+
+	// Reset file pointer for copying
+	if _, err := file.Seek(0, 0); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Failed to reset file pointer")
+		return
+	}
+
+	// Ensure song directory exists
+	if err := os.MkdirAll(h.cfg.SongDir, 0755); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to create song directory: %v", err))
+		return
+	}
+
+	// Generate unique filename
+	filename := fmt.Sprintf("%d_%s", time.Now().UnixNano(), header.Filename)
+	filePath := filepath.Join(h.cfg.SongDir, filename)
+
+	// Create the file
+	dst, err := os.Create(filePath)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to create file: %v", err))
+		return
+	}
+	defer dst.Close()
+
+	// Copy the uploaded file
+	if _, err := io.Copy(dst, file); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to save file: %v", err))
+		return
+	}
+
+	// Save to database
+	_, err = h.db.Exec("INSERT INTO songs (title, artist, duration, location) VALUES (?, ?, ?, ?)",
+		title, artist, duration, filePath)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to add song: %v", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, messageSuccessTemplate, fmt.Sprintf("Song '%s' uploaded successfully!", title))
+}
+
+// AddToQueueHTMX adds a song to queue and returns HTML message
+func (h *Handler) AddToQueueHTMX(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract song ID from URL path /admin/queue/{id}
+	path := r.URL.Path
+	prefix := "/admin/queue/"
+	if !strings.HasPrefix(path, prefix) {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	idStr := path[len(prefix):]
+	songID, err := strconv.Atoi(idStr)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Invalid song ID")
+		return
+	}
+
+	// Check if song exists
+	var exists bool
+	err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM songs WHERE id = ?)", songID).Scan(&exists)
+	if err != nil || !exists {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Song not found")
+		return
+	}
+
+	var title string
+	err = h.db.QueryRow("SELECT title FROM songs WHERE id = ?", songID).Scan(&title)
+	if err != nil {
+		title = "Song"
+	}
+
+	if err := h.queue.Add(songID); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to add to queue: %v", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, messageSuccessTemplate, fmt.Sprintf("'%s' added to queue!", title))
+}
+
+// RemoveFromQueueHTMX removes a song from queue and returns HTML message
+func (h *Handler) RemoveFromQueueHTMX(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract queue item ID from URL path /admin/queue/{id}
+	path := r.URL.Path
+	prefix := "/admin/queue/"
+	if !strings.HasPrefix(path, prefix) {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	idStr := path[len(prefix):]
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Invalid queue item ID")
+		return
+	}
+
+	if err := h.queue.Remove(id); err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to remove from queue: %v", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, messageSuccessTemplate, "Removed from queue!")
+}
+
+// DeleteSongHTMX deletes a song and returns HTML message
+func (h *Handler) DeleteSongHTMX(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract song ID from URL path /admin/songs/{id}
+	path := r.URL.Path
+	prefix := "/admin/songs/"
+	if !strings.HasPrefix(path, prefix) {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	idStr := path[len(prefix):]
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Invalid song ID")
+		return
+	}
+
+	result, err := h.db.Exec("DELETE FROM songs WHERE id = ?", id)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, fmt.Sprintf("Failed to delete song: %v", err))
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, messageErrorTemplate, "Song not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprintf(w, messageSuccessTemplate, "Song deleted successfully!")
+}
+
+// ==================== HELPER METHODS ====================
+
+func (h *Handler) renderSongsFragment() string {
+	rows, err := h.db.Query("SELECT id, title, artist, duration, location FROM songs ORDER BY created_at DESC")
+	if err != nil {
+		return emptySongsTemplate
+	}
+	defer rows.Close()
+
+	var rowsHTML string
+	count := 0
+	for rows.Next() {
+		var song SongResponse
+		err := rows.Scan(&song.ID, &song.Title, &song.Artist, &song.Duration, &song.Location)
+		if err != nil {
+			continue
+		}
+		rowsHTML += fmt.Sprintf(songRowTemplate, song.Title, song.Artist, song.Duration, song.ID, song.ID)
+		count++
+	}
+
+	if count == 0 {
+		return emptySongsTemplate
+	}
+
+	return fmt.Sprintf(songsTableTemplate, rowsHTML)
+}
+
+func (h *Handler) renderQueueFragment() string {
+	items, err := h.queue.GetAll()
+	if err != nil {
+		return emptyQueueTemplate
+	}
+
+	if len(items) == 0 {
+		return emptyQueueTemplate
+	}
+
+	var rowsHTML string
+	for _, item := range items {
+		rowsHTML += fmt.Sprintf(queueRowTemplate, item.Position, item.Song.Title, item.Song.Artist, item.Song.Duration, item.ID)
+	}
+
+	return fmt.Sprintf(queueTableTemplate, rowsHTML)
+}
+
+func (h *Handler) renderNowPlayingFragment() string {
+	var songID int
+	err := h.db.QueryRow("SELECT value FROM state WHERE key = 'current_song'").Scan(&songID)
+	if err != nil {
+		// No song playing
+		if h.playback != nil && h.playback.IsPaused() {
+			return fmt.Sprintf(nowPlayingEmptyTemplate, "paused", "Paused", "play", "▶ Play")
+		}
+		return fmt.Sprintf(nowPlayingEmptyTemplate, "playing", "Waiting for queue", "stop", "⏸ Pause")
+	}
+
+	var song SongResponse
+	err = h.db.QueryRow("SELECT id, title, artist, duration, location FROM songs WHERE id = ?", songID).
+		Scan(&song.ID, &song.Title, &song.Artist, &song.Duration, &song.Location)
+	if err != nil {
+		if h.playback != nil && h.playback.IsPaused() {
+			return fmt.Sprintf(nowPlayingEmptyTemplate, "paused", "Paused", "play", "▶ Play")
+		}
+		return fmt.Sprintf(nowPlayingEmptyTemplate, "playing", "Waiting for queue", "stop", "⏸ Pause")
+	}
+
+	if h.playback != nil && h.playback.IsPaused() {
+		return fmt.Sprintf(nowPlayingTemplate, song.Title, song.Artist, song.Duration, "paused", "Paused", "play", "▶ Play")
+	}
+	return fmt.Sprintf(nowPlayingTemplate, song.Title, song.Artist, song.Duration, "playing", "Playing", "stop", "⏸ Pause")
 }

@@ -49,6 +49,7 @@ func main() {
 
 	// Initialize admin handler
 	adminHandler := admin.New(db.DB, queueManager, cfg)
+	adminHandler.SetPlayback(playbackEngine)
 
 	// Setup HTTP server
 	mux := http.NewServeMux()
@@ -91,6 +92,7 @@ func main() {
 	go func() {
 		log.Printf("Server listening on port %s", cfg.Port)
 		log.Printf("Stream endpoint: http://localhost:%s/stream", cfg.Port)
+		log.Printf("Admin page: http://localhost:%s/admin", cfg.Port)
 		log.Printf("Admin API: http://localhost:%s/api", cfg.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
